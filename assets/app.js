@@ -57,6 +57,36 @@ const newRequest = (over={}) => ({
 
 /* ---------------- Persistence ---------------- */
 const LS_KEY = 'postpigeon.v1';
+// Tabs are deliberately NOT pushed to the server — they're a per-browser
+// editor state, not a workspace artifact. Persisting locally means reload
+// doesn't drop unsaved in-flight requests.
+const LS_TABS_KEY = 'postpigeon.tabs.v1';
+let _tabPersistTimer = null;
+function persistTabsLocal() {
+  if (_tabPersistTimer) clearTimeout(_tabPersistTimer);
+  _tabPersistTimer = setTimeout(() => {
+    try {
+      // Strip volatile fields before persisting so the cache stays small.
+      const slim = STATE.tabs.map(t => ({
+        id: t.id, name: t.name, dirty: !!t.dirty,
+        request: simplify(t.request),
+      }));
+      localStorage.setItem(LS_TABS_KEY, JSON.stringify({
+        tabs: slim, activeTabId: STATE.activeTabId,
+      }));
+    } catch {}
+  }, 300);
+}
+function loadTabsLocal() {
+  try {
+    const raw = localStorage.getItem(LS_TABS_KEY);
+    if (!raw) return null;
+    const j = JSON.parse(raw);
+    if (!j || !Array.isArray(j.tabs) || !j.tabs.length) return null;
+    j.tabs.forEach(t => { if (t.request) normalizeRequest(t.request); });
+    return j;
+  } catch { return null; }
+}
 // Debounce server writes so a flurry of UI changes coalesces into one PUT.
 let _persistTimer = null;
 let _persistInFlight = false;
@@ -227,8 +257,10 @@ function resolveVars(str) {
 function highlightVars(text) {
   const m = getVarMap();
   const escaped = text.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-  return escaped.replace(/\{\{([^}]+)\}\}/g, (_, k) =>
-    `<span class="var ${m.has(k.trim()) ? '' : 'unset'}">{{${k}}}</span>`);
+  return escaped.replace(/\{\{([^}]+)\}\}/g, (_, k) => {
+    const trimmed = k.trim();
+    return `<span class="var ${m.has(trimmed) ? '' : 'unset'}">{{${trimmed}}}</span>`;
+  });
 }
 
 /* ---------------- Send ---------------- */
@@ -295,6 +327,16 @@ async function sendRequest(req) {
     }
   } catch (err) {
     resp = { error: String(err && err.message || err), timeMs: Math.round(performance.now() - t0) };
+  }
+
+  // Some proxy responses fall back to base64 for non-UTF-8 bodies. Decode
+  // here so the response viewer sees the raw bytes (interpreted as latin-1
+  // text — good enough for hex inspection and avoids a base64 wall of text).
+  if (resp && resp.bodyEncoding === 'base64' && typeof resp.body === 'string') {
+    try {
+      resp.body = atob(resp.body);
+    } catch { /* malformed payload — leave as-is */ }
+    delete resp.bodyEncoding;
   }
 
   req.response = resp;
@@ -423,6 +465,7 @@ function openRequestInTab(req) {
   STATE.activeTabId = id;
   renderTabs();
   renderActivePanel();
+  persistTabsLocal();
 }
 function nameFromUrl(u) { try { return new URL(u).pathname.replace(/^\/+/, '') || u; } catch { return u; } }
 
@@ -440,7 +483,7 @@ function renderTabs() {
       <button class="tab-close" title="Close">×</button>`;
     el.addEventListener('click', e => {
       if (e.target.classList.contains('tab-close')) { closeTab(t.id); return; }
-      STATE.activeTabId = t.id; renderTabs(); renderActivePanel();
+      STATE.activeTabId = t.id; renderTabs(); renderActivePanel(); persistTabsLocal();
     });
     bar.appendChild(el);
   }
@@ -455,6 +498,7 @@ function closeTab(id) {
   STATE.tabs.splice(i, 1);
   if (STATE.activeTabId === id) STATE.activeTabId = (STATE.tabs[i] || STATE.tabs[i-1] || {}).id || null;
   if (!STATE.tabs.length) openRequestInTab(newRequest()); else { renderTabs(); renderActivePanel(); }
+  persistTabsLocal();
 }
 
 function renderActivePanel() {
@@ -636,6 +680,7 @@ function markDirty(tab) {
     const span = el?.querySelector('.tab-name'); if (span) span.textContent = tab.name;
     const meth = el?.querySelector('.tab-method'); if (meth) { meth.dataset.m = r.method; meth.textContent = r.method; }
   }
+  persistTabsLocal();
 }
 
 /* ---------------- Subtab + KV ---------------- */
@@ -737,7 +782,10 @@ function renderResponse(panel, r) {
     body.innerHTML = `<div class="resp-error">⚠ ${escapeHtml(res.error)}</div>`;
     return;
   }
-  const cls = String(res.status)[0];
+  // status=0 with no .error means a soft failure (e.g. proxy returned an
+  // empty envelope). Treat it like a 5xx so the pill doesn't end up styled
+  // as data-class="0" (which has no styling and looks broken).
+  const cls = res.status > 0 ? String(res.status)[0] : '5';
   const sizeKb = res.sizeBytes ? (res.sizeBytes/1024).toFixed(1) : '0';
   meta.innerHTML = `
     <span class="status-pill" data-class="${cls}">${res.status} ${statusText(res.status)}</span>
@@ -848,11 +896,24 @@ function renderResponse(panel, r) {
     }
     if (which === 'timeline') {
       const total = res.timeMs || 0;
-      const denom = Math.max(1, total);
-      // synthetic split (proxy doesn't expose phases)
-      const dns = Math.round(total*0.05), tcp = Math.round(total*0.10),
-            tls = Math.round(total*0.10), wait = Math.round(total*0.65),
-            dl  = Math.max(0, total - dns - tcp - tls - wait);
+      // Prefer real cURL phases (proxy.php returns them via curl_getinfo).
+      // Fall back to a synthetic split so old responses in history still draw.
+      let dns, tcp, tls, wait, dl, real = false;
+      if (res.phases && typeof res.phases === 'object') {
+        dns  = +res.phases.dns      || 0;
+        tcp  = +res.phases.tcp      || 0;
+        tls  = +res.phases.tls      || 0;
+        wait = +res.phases.wait     || 0;
+        dl   = +res.phases.download || 0;
+        real = true;
+      } else {
+        dns  = Math.round(total*0.05);
+        tcp  = Math.round(total*0.10);
+        tls  = Math.round(total*0.10);
+        wait = Math.round(total*0.65);
+        dl   = Math.max(0, total - dns - tcp - tls - wait);
+      }
+      const denom = Math.max(1, dns + tcp + tls + wait + dl);
       const pct = n => ((n / denom) * 100).toFixed(2);
       const wrap = document.createElement('div'); wrap.className = 'timeline';
       wrap.innerHTML = `
@@ -869,7 +930,7 @@ function renderResponse(panel, r) {
           <span><i class="seg-tls" style="background:#b07cd9"></i>TLS ${tls} ms</span>
           <span><i class="seg-wait" style="background:#d9a441"></i>Server ${wait} ms</span>
           <span><i class="seg-download" style="background:#d96363"></i>Download ${dl} ms</span>
-          <span class="muted">total ${total} ms · synthetic phases</span>
+          <span class="muted">total ${total} ms · ${real ? 'cURL phases' : 'synthetic phases'}</span>
         </div>`;
       body.appendChild(wrap); return;
     }
@@ -931,20 +992,67 @@ function renderCollections() {
         <span class="tree-caret">▾</span>
         <span class="tree-group-name">${escapeHtml(col.name)}</span>
         <span class="tree-group-meta">${col.requests.length}</span>
+        <span class="tree-actions">
+          <button class="icon-btn tree-act" data-act="rename"  title="Rename collection">✎</button>
+          <button class="icon-btn tree-act" data-act="delete"  title="Delete collection">✕</button>
+        </span>
       </div>
       <div class="tree-children"></div>`;
-    g.querySelector('.tree-group-header').addEventListener('click', () => {
+    const header = g.querySelector('.tree-group-header');
+    header.addEventListener('click', e => {
+      if (e.target.closest('.tree-act')) return;
       col.open = (g.dataset.open !== 'true'); g.dataset.open = col.open; persist();
+    });
+    header.querySelector('[data-act="rename"]').addEventListener('click', e => {
+      e.stopPropagation();
+      const name = prompt('Rename collection:', col.name);
+      if (name && name.trim()) { col.name = name.trim(); persist(); renderCollections(); }
+    });
+    header.querySelector('[data-act="delete"]').addEventListener('click', e => {
+      e.stopPropagation();
+      if (!confirm(`Delete collection "${col.name}" and its ${col.requests.length} request(s)?`)) return;
+      STATE.collections = STATE.collections.filter(c => c.id !== col.id);
+      persist(); renderCollections();
     });
     const kids = g.querySelector('.tree-children');
     col.requests.forEach(req => {
       const leaf = document.createElement('div'); leaf.className = 'tree-leaf';
       leaf.innerHTML = `<span class="method-tag" data-m="${req.method}">${req.method}</span>
-                       <span class="tree-leaf-name">${escapeHtml(req.name || nameFromUrl(req.url))}</span>`;
-      leaf.addEventListener('click', () => openRequestInTab(req));
+                       <span class="tree-leaf-name">${escapeHtml(req.name || nameFromUrl(req.url))}</span>
+                       <span class="tree-actions">
+                         <button class="icon-btn tree-act" data-act="rename"    title="Rename request">✎</button>
+                         <button class="icon-btn tree-act" data-act="duplicate" title="Duplicate request">⎘</button>
+                         <button class="icon-btn tree-act" data-act="delete"    title="Delete request">✕</button>
+                       </span>`;
+      leaf.addEventListener('click', e => {
+        if (e.target.closest('.tree-act')) return;
+        openRequestInTab(req);
+      });
+      leaf.querySelector('[data-act="rename"]').addEventListener('click', e => {
+        e.stopPropagation();
+        const name = prompt('Rename request:', req.name || '');
+        if (name && name.trim()) { req.name = name.trim(); persist(); renderCollections(); }
+      });
+      leaf.querySelector('[data-act="duplicate"]').addEventListener('click', e => {
+        e.stopPropagation();
+        const copy = structuredClone(req);
+        copy.id = uid();
+        copy.name = (req.name || 'Untitled') + ' (copy)';
+        col.requests.push(copy);
+        persist(); renderCollections();
+      });
+      leaf.querySelector('[data-act="delete"]').addEventListener('click', e => {
+        e.stopPropagation();
+        if (!confirm(`Delete "${req.name || req.url}"?`)) return;
+        col.requests = col.requests.filter(r => r.id !== req.id);
+        persist(); renderCollections();
+      });
       kids.appendChild(leaf);
     });
     tree.appendChild(g);
+  }
+  if (!STATE.collections.length) {
+    tree.innerHTML = '<p class="muted" style="padding:14px;font:500 12px var(--mono)">No collections yet — click + to create one.</p>';
   }
 }
 function renderHistory() {
@@ -970,10 +1078,28 @@ function renderEnvs() {
         <span class="tree-caret">▾</span>
         <span class="tree-group-name">${escapeHtml(env.name)} ${isActive?'<span class="muted">· active</span>':''}</span>
         <span class="tree-group-meta">${env.vars.length}</span>
+        <span class="tree-actions">
+          <button class="icon-btn tree-act" data-act="rename" title="Rename environment">✎</button>
+          <button class="icon-btn tree-act" data-act="delete" title="Delete environment">✕</button>
+        </span>
       </div>
       <div class="tree-children"></div>`;
-    g.querySelector('.tree-group-header').addEventListener('click', () => {
+    const header = g.querySelector('.tree-group-header');
+    header.addEventListener('click', e => {
+      if (e.target.closest('.tree-act')) return;
       g.dataset.open = (g.dataset.open !== 'true');
+    });
+    header.querySelector('[data-act="rename"]').addEventListener('click', e => {
+      e.stopPropagation();
+      const name = prompt('Rename environment:', env.name);
+      if (name && name.trim()) { env.name = name.trim(); persist(); renderEnvs(); renderEnvSwitcher(); }
+    });
+    header.querySelector('[data-act="delete"]').addEventListener('click', e => {
+      e.stopPropagation();
+      if (!confirm(`Delete environment "${env.name}"?`)) return;
+      STATE.envs = STATE.envs.filter(x => x.id !== env.id);
+      if (STATE.activeEnvId === env.id) STATE.activeEnvId = STATE.envs[0]?.id || null;
+      persist(); renderEnvs(); renderEnvSwitcher(); refreshAllOverlays();
     });
     const kids = g.querySelector('.tree-children');
     env.vars.forEach(v => {
@@ -991,6 +1117,9 @@ function renderEnvs() {
     editBtn.addEventListener('click', e => { e.stopPropagation(); openEnvEditor(env); });
     kids.appendChild(editBtn);
     tree.appendChild(g);
+  }
+  if (!STATE.envs.length) {
+    tree.innerHTML = '<p class="muted" style="padding:14px;font:500 12px var(--mono)">No environments yet — click + to create one.</p>';
   }
 }
 function renderEnvSwitcher() {
@@ -1052,10 +1181,32 @@ function openSaveModal(tab) {
     const col = STATE.collections.find(c => c.id === colId);
     const stored = structuredClone(simplify(tab.request));
     stored.name = name;
-    col.requests.push(stored);
+    // Update in place when an entry with the same id already exists in this
+    // collection (re-saving from a tab opened off the sidebar). Otherwise
+    // also coalesce by name to avoid silent duplicates on rename-and-save.
+    const byId   = col.requests.findIndex(r => r.id && r.id === tab.request.id);
+    const byName = byId < 0 ? col.requests.findIndex(r => (r.name || '') === name) : -1;
+    let action = 'saved';
+    if (byId >= 0) {
+      stored.id = col.requests[byId].id;
+      col.requests[byId] = stored;
+      action = 'updated';
+    } else if (byName >= 0) {
+      if (confirm(`A request named "${name}" already exists in ${col.name}. Overwrite it?`)) {
+        stored.id = col.requests[byName].id;
+        col.requests[byName] = stored;
+        action = 'updated';
+      } else {
+        col.requests.push(stored);
+      }
+    } else {
+      col.requests.push(stored);
+    }
+    // Re-sync the open tab so subsequent saves keep the same id.
+    tab.request.id = stored.id;
     tab.name = name; tab.dirty = false;
     closeModal(); renderTabs(); renderCollections(); persist();
-    toast('Saved to ' + col.name, 'ok');
+    toast(action === 'updated' ? `Updated in ${col.name}` : `Saved to ${col.name}`, 'ok');
   });
 }
 
@@ -1211,24 +1362,140 @@ function openImportModal() {
   });
 }
 function parseCurl(s) {
-  // very basic curl parser — handles -X, -H, -d/--data, url
-  const matched = s.match(/(?:[^\s'"]+|'[^']*'|"[^"]*")+/g);
-  if (!matched || matched.length < 2) throw new Error('No tokens in curl command');
-  const tokens = matched.slice(1);
-  const r = newRequest();
-  for (let i=0; i<tokens.length; i++) {
-    const t = tokens[i].replace(/^['"]|['"]$/g, '');
-    if (t === '-X' || t === '--request') r.method = tokens[++i].replace(/['"]/g,'').toUpperCase();
-    else if (t === '-H' || t === '--header') {
-      const hv = tokens[++i].replace(/^['"]|['"]$/g,''); const idx = hv.indexOf(':');
-      if (idx > 0) r.headers.push({key: hv.slice(0,idx).trim(), val: hv.slice(idx+1).trim(), enabled:true});
-    } else if (t === '-d' || t === '--data' || t === '--data-raw') {
-      r.body.mode = 'raw'; r.body.raw = tokens[++i].replace(/^['"]|['"]$/g,''); r.body.rawType = 'json';
-      if (r.method === 'GET') r.method = 'POST';
-    } else if (t.startsWith('http')) r.url = t;
+  // Tokenize a curl command line. Handles single/double-quoted strings with
+  // basic escapes, $'...' ANSI-C quoting (curl convert-to-code emits these),
+  // line-continuation backslashes, and the common --opt=val form.
+  const tokens = tokenizeShell(s.replace(/\\\r?\n/g, ' '));
+  if (!tokens.length || !/^curl$/i.test(tokens[0])) {
+    throw new Error('Not a curl command (expected to start with "curl")');
   }
+  const args = tokens.slice(1);
+  const r = newRequest();
+  let methodSetExplicitly = false;
+
+  const setMethod = m => { r.method = m.toUpperCase(); methodSetExplicitly = true; };
+  const pushHeader = hv => {
+    const idx = hv.indexOf(':');
+    if (idx > 0) {
+      r.headers.push({key: hv.slice(0,idx).trim(), val: hv.slice(idx+1).trim(), enabled:true});
+    }
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    let t = args[i];
+    // Split --opt=value into two args so the rest of the loop is uniform.
+    let inlineVal = null;
+    if (t.startsWith('--') && t.includes('=')) {
+      const eq = t.indexOf('=');
+      inlineVal = t.slice(eq + 1);
+      t = t.slice(0, eq);
+    }
+    const take = () => {
+      if (inlineVal !== null) { const v = inlineVal; inlineVal = null; return v; }
+      return args[++i];
+    };
+
+    if (t === '-X' || t === '--request') {
+      setMethod(take() || 'GET');
+    } else if (t === '-H' || t === '--header') {
+      pushHeader(take() || '');
+    } else if (t === '-d' || t === '--data' || t === '--data-raw' || t === '--data-binary' || t === '--data-ascii') {
+      r.body.mode = 'raw';
+      r.body.raw = take() || '';
+      r.body.rawType = looksJson(r.body.raw) ? 'json' : 'text';
+      if (!methodSetExplicitly) r.method = 'POST';
+    } else if (t === '--data-urlencode') {
+      r.body.mode = 'urlencoded';
+      const pair = take() || '';
+      const eq = pair.indexOf('=');
+      if (eq > 0) {
+        r.urlencoded.push({key: pair.slice(0, eq), val: pair.slice(eq + 1), enabled: true});
+      } else {
+        r.urlencoded.push({key: pair, val: '', enabled: true});
+      }
+      if (!methodSetExplicitly) r.method = 'POST';
+    } else if (t === '-u' || t === '--user') {
+      const creds = take() || '';
+      const i2 = creds.indexOf(':');
+      r.auth.type = 'basic';
+      r.auth.basic.user = i2 >= 0 ? creds.slice(0, i2) : creds;
+      r.auth.basic.pass = i2 >= 0 ? creds.slice(i2 + 1) : '';
+    } else if (t === '--url') {
+      r.url = take() || '';
+    } else if (t === '-A' || t === '--user-agent') {
+      pushHeader('User-Agent: ' + (take() || ''));
+    } else if (t === '-e' || t === '--referer') {
+      pushHeader('Referer: ' + (take() || ''));
+    } else if (t === '-b' || t === '--cookie') {
+      pushHeader('Cookie: ' + (take() || ''));
+    } else if (t === '-k' || t === '--insecure') {
+      r.settings.verifySSL = false;
+    } else if (t === '-L' || t === '--location') {
+      r.settings.followRedirects = true;
+    } else if (t === '--max-time') {
+      const n = parseInt(take() || '', 10); if (!isNaN(n)) r.settings.timeout = Math.max(1, Math.min(600, n));
+    } else if (t === '-G' || t === '--get') {
+      if (!methodSetExplicitly) r.method = 'GET';
+    } else if (t === '--compressed' || t === '-s' || t === '--silent' || t === '-v' || t === '--verbose'
+            || t === '-i' || t === '--include' || t === '-#' || t === '--progress-bar') {
+      /* flags we can safely ignore */
+    } else if (!t.startsWith('-')) {
+      if (!r.url) r.url = t;
+    }
+  }
+  if (!r.url) throw new Error('No URL found in curl command');
   r.name = nameFromUrl(r.url) || 'Imported';
   return r;
+}
+
+// Minimal POSIX-style shell tokenizer: handles ' "..." escapes, and curl's
+// $'...' ANSI-C quoting (with \n, \t, \r, \\, \', \").
+function tokenizeShell(s) {
+  const out = [];
+  let cur = '';
+  let inSingle = false, inDouble = false, inAnsiC = false;
+  let any = false; // tracks whether we've started a token (so empty quoted strings still emit)
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inAnsiC) {
+      if (c === '\'') { inAnsiC = false; continue; }
+      if (c === '\\' && i + 1 < s.length) {
+        const n = s[++i];
+        cur += ({n:'\n', t:'\t', r:'\r', '\\':'\\', '\'':'\'', '"':'"'}[n] ?? n);
+      } else cur += c;
+      any = true;
+      continue;
+    }
+    if (inSingle) {
+      if (c === '\'') inSingle = false;
+      else cur += c;
+      any = true;
+      continue;
+    }
+    if (inDouble) {
+      if (c === '"') inDouble = false;
+      else if (c === '\\' && i + 1 < s.length && /["\\$`]/.test(s[i+1])) { cur += s[++i]; }
+      else cur += c;
+      any = true;
+      continue;
+    }
+    if (c === '$' && s[i+1] === '\'') { inAnsiC = true; i++; any = true; continue; }
+    if (c === '\'') { inSingle = true; any = true; continue; }
+    if (c === '"')  { inDouble = true; any = true; continue; }
+    if (/\s/.test(c)) { if (any) { out.push(cur); cur = ''; any = false; } continue; }
+    if (c === '\\' && i + 1 < s.length) { cur += s[++i]; any = true; continue; }
+    cur += c; any = true;
+  }
+  if (any) out.push(cur);
+  return out;
+}
+
+function looksJson(s) {
+  if (typeof s !== 'string') return false;
+  const t = s.trim();
+  if (!t) return false;
+  if (t[0] !== '{' && t[0] !== '[') return false;
+  try { JSON.parse(t); return true; } catch { return false; }
 }
 
 function openExportModal() {
@@ -1407,8 +1674,8 @@ async function signOut() {
   try {
     await ppFetch('auth.php?action=logout', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
   } catch {}
-  // Clear cached workspace so the next user on this machine doesn't see leftover data.
-  try { localStorage.removeItem(LS_KEY); } catch {}
+  // Clear cached workspace + tabs so the next user on this machine doesn't see leftover data.
+  try { localStorage.removeItem(LS_KEY); localStorage.removeItem(LS_TABS_KEY); } catch {}
   location.replace('login.html?reason=logout');
 }
 
@@ -1620,7 +1887,18 @@ async function adminRowAction(u, act) {
     openChangePasswordModal(/* forced */ true);
   }
 
-  // Open one tab to start
-  const seedReq = STATE.collections[0]?.requests[0] || newRequest({ method:'GET', url:'https://httpbin.org/get?hello={{baseUrl}}' });
-  openRequestInTab(seedReq);
+  // Restore tabs from the previous session if we have any. Otherwise open a
+  // seed request so the workspace doesn't boot blank.
+  const restored = loadTabsLocal();
+  if (restored) {
+    STATE.tabs = restored.tabs.map(t => ({
+      id: t.id, name: t.name, dirty: !!t.dirty,
+      request: normalizeRequest(t.request),
+    }));
+    STATE.activeTabId = STATE.tabs.find(t => t.id === restored.activeTabId)?.id || STATE.tabs[0].id;
+    renderTabs(); renderActivePanel();
+  } else {
+    const seedReq = STATE.collections[0]?.requests[0] || newRequest({ method:'GET', url:'https://httpbin.org/get?hello={{baseUrl}}' });
+    openRequestInTab(seedReq);
+  }
 })();

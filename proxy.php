@@ -1,10 +1,12 @@
 <?php
 // proxy.php — Post Pigeon's server-side cURL proxy so the browser can hit any API
 // without CORS interference. Returns a JSON envelope with the response
-// body, status, headers, and timing.
+// body, status, headers, real timing phases, and effective request metadata.
 //
 // Authentication: the caller must hold a valid session cookie. This is what
 // stops a public deployment from being abused as an open SSRF gateway.
+
+declare(strict_types=1);
 
 require_once __DIR__ . '/lib/util.php';
 require_once __DIR__ . '/lib/db.php';
@@ -15,44 +17,48 @@ pp_check_same_origin();
 pp_require_user();
 
 if (!function_exists('curl_init')) {
-    http_response_code(500);
-    echo json_encode(['error' => 'PHP cURL extension is not enabled on this host.']);
-    exit;
+    pp_json_error(500, 'PHP cURL extension is not enabled on this host.');
 }
 
-$raw = file_get_contents('php://input');
-if (strlen($raw) > 16 * 1024 * 1024) { // 16 MiB request cap
-    http_response_code(413);
-    echo json_encode(['error' => 'Request too large']);
-    exit;
+// We only consume JSON. Refusing other content types blocks form-encoded
+// CSRF attempts even when a deployment's Origin header is stripped by a proxy.
+$ct = $_SERVER['CONTENT_TYPE'] ?? '';
+if ($ct !== '' && stripos($ct, 'application/json') === false) {
+    pp_json_error(415, 'Expected Content-Type: application/json');
 }
-$req = json_decode($raw, true);
-if (!$req || empty($req['url'])) {
-    http_response_code(400);
-    echo json_encode(['error' => 'Missing url']);
-    exit;
+
+$req = pp_read_json_body();
+if (empty($req['url']) || !is_string($req['url'])) {
+    pp_json_error(400, 'Missing url');
 }
 
 $url = (string)$req['url'];
 // Only allow http(s) — blocks file://, gopher://, dict://, etc.
-$scheme = strtolower(parse_url($url, PHP_URL_SCHEME) ?: '');
+$scheme = strtolower((string)(parse_url($url, PHP_URL_SCHEME) ?: ''));
 if ($scheme !== 'http' && $scheme !== 'https') {
-    http_response_code(400);
-    echo json_encode(['error' => 'Only http and https URLs are allowed']);
-    exit;
+    pp_json_error(400, 'Only http and https URLs are allowed');
 }
 
-$method  = strtoupper(preg_replace('/[^A-Z]/i', '', $req['method'] ?? 'GET')) ?: 'GET';
+// SSRF guard: by default refuse private / loopback / link-local targets so an
+// authenticated user can't probe the host's internal network through us.
+// Operators who actually need this (e.g. testing 127.0.0.1 on a dev box) can
+// set 'proxy_allow_private' => true in config.php.
+if (!pp_config_get('proxy_allow_private', false)) {
+    $reason = pp_ssrf_block_reason($url);
+    if ($reason !== null) {
+        pp_json_error(400, 'Refusing to proxy: ' . $reason);
+    }
+}
+
+$method  = strtoupper((string)preg_replace('/[^A-Z]/i', '', (string)($req['method'] ?? 'GET'))) ?: 'GET';
 $headers = is_array($req['headers'] ?? null) ? $req['headers'] : [];
 $body    = $req['body'] ?? null;
-$timeout = (int)($req['timeout'] ?? 30);
-if ($timeout < 1)   $timeout = 1;
-if ($timeout > 600) $timeout = 600;
+$timeout = pp_clamp_int($req['timeout'] ?? 30, 1, 600, 30);
 $followRedirects = !empty($req['followRedirects']);
 $verifySSL = !array_key_exists('verifySSL', $req) ? true : (bool)$req['verifySSL'];
 
 $ch = curl_init();
-curl_setopt_array($ch, [
+$curlOpts = [
     CURLOPT_URL            => $url,
     CURLOPT_CUSTOMREQUEST  => $method,
     CURLOPT_RETURNTRANSFER => true,
@@ -64,9 +70,19 @@ curl_setopt_array($ch, [
     CURLOPT_SSL_VERIFYPEER => $verifySSL,
     CURLOPT_SSL_VERIFYHOST => $verifySSL ? 2 : 0,
     CURLOPT_ENCODING       => '',
-    CURLOPT_PROTOCOLS      => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-    CURLOPT_REDIR_PROTOCOLS=> CURLPROTO_HTTP | CURLPROTO_HTTPS,
-]);
+];
+
+// CURLOPT_PROTOCOLS_STR is the modern (cURL 7.85+) equivalent; older libcurl
+// versions still need the bitmask constants. Use whichever is available so we
+// don't trip deprecation warnings on newer hosts.
+if (defined('CURLOPT_PROTOCOLS_STR')) {
+    $curlOpts[CURLOPT_PROTOCOLS_STR]       = 'http,https';
+    $curlOpts[CURLOPT_REDIR_PROTOCOLS_STR] = 'http,https';
+} else {
+    $curlOpts[CURLOPT_PROTOCOLS]       = CURLPROTO_HTTP | CURLPROTO_HTTPS;
+    $curlOpts[CURLOPT_REDIR_PROTOCOLS] = CURLPROTO_HTTP | CURLPROTO_HTTPS;
+}
+curl_setopt_array($ch, $curlOpts);
 
 $hdrLines = [];
 $hasUA = false;
@@ -92,41 +108,69 @@ $resp = curl_exec($ch);
 $t1 = microtime(true);
 
 if ($resp === false) {
-    http_response_code(502);
-    echo json_encode([
-        'error'  => curl_error($ch) ?: 'cURL request failed',
-        'errno'  => curl_errno($ch),
+    $err   = curl_error($ch) ?: 'cURL request failed';
+    $errno = curl_errno($ch);
+    curl_close($ch);
+    pp_json(502, [
+        'error'  => $err,
+        'errno'  => $errno,
         'timeMs' => (int)(($t1 - $t0) * 1000),
     ]);
-    curl_close($ch);
-    exit;
 }
 
 $info       = curl_getinfo($ch);
-$headerSize = $info['header_size'] ?? 0;
-$rawHeaders = substr($resp, 0, $headerSize);
-$respBody   = substr($resp, $headerSize);
+$headerSize = (int)($info['header_size'] ?? 0);
+$rawHeaders = (string)substr((string)$resp, 0, $headerSize);
+$respBody   = (string)substr((string)$resp, $headerSize);
 
+// Parse the LAST response's headers — cURL concatenates 1xx and redirect
+// preludes when followLocation is on, so we want the final block.
 $blocks = preg_split("/\r?\n\r?\n/", trim($rawHeaders));
-$lastBlock = end($blocks);
+$lastBlock = is_array($blocks) ? (string)end($blocks) : '';
 $parsedHeaders = [];
-foreach (preg_split("/\r?\n/", $lastBlock) as $i => $line) {
+foreach (preg_split("/\r?\n/", $lastBlock) ?: [] as $i => $line) {
     if ($i === 0) continue; // status line
     if (strpos($line, ':') === false) continue;
     [$k, $v] = explode(':', $line, 2);
     $parsedHeaders[] = ['name' => trim($k), 'value' => trim($v)];
 }
 
+// Real timing breakdown from libcurl. All values are seconds-since-start of
+// the transfer, so we diff them to get phase durations. See:
+//   namelookup_time → DNS
+//   connect_time    → connect (TCP)
+//   appconnect_time → TLS handshake (0 on plain http)
+//   pretransfer_time→ ready-to-send pivot
+//   starttransfer_time → time to first response byte (server "wait")
+//   total_time      → end of transfer
+$ms = static fn(float $s): int => (int)round($s * 1000);
+$nl  = (float)($info['namelookup_time']    ?? 0);
+$cn  = (float)($info['connect_time']       ?? 0);
+$ac  = (float)($info['appconnect_time']    ?? 0);
+$pt  = (float)($info['pretransfer_time']   ?? 0);
+$st  = (float)($info['starttransfer_time'] ?? 0);
+$tot = (float)($info['total_time']         ?? ($t1 - $t0));
+
+$phases = [
+    'dns'      => $ms($nl),
+    'tcp'      => $ms(max(0.0, $cn - $nl)),
+    'tls'      => $ms(max(0.0, $ac > 0 ? $ac - $cn : 0.0)),
+    'wait'     => $ms(max(0.0, $st - $pt)),
+    'download' => $ms(max(0.0, $tot - $st)),
+    'total'    => $ms($tot),
+];
+
 curl_close($ch);
 
 $envelope = [
-    'status'    => $info['http_code']      ?? 0,
-    'timeMs'    => (int)(($t1 - $t0) * 1000),
+    'status'    => (int)($info['http_code']      ?? 0),
+    'timeMs'    => $phases['total'] ?: (int)(($t1 - $t0) * 1000),
     'sizeBytes' => strlen($respBody),
     'headers'   => $parsedHeaders,
     'body'      => $respBody,
-    'finalUrl'  => $info['url']            ?? $url,
-    'redirects' => $info['redirect_count'] ?? 0,
+    'finalUrl'  => (string)($info['url']            ?? $url),
+    'redirects' => (int)($info['redirect_count'] ?? 0),
+    'phases'    => $phases,
 ];
 
 // JSON_INVALID_UTF8_SUBSTITUTE keeps non-UTF-8 / binary bodies from crashing the encode.
@@ -135,15 +179,14 @@ if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTIT
 $out = json_encode($envelope, $flags);
 
 if ($out === false) {
-    // Last-ditch fallback: base64-encode the body so the envelope is always valid JSON.
-    $envelope['body']        = base64_encode($respBody);
+    // Last-ditch fallback: base64-encode the body so the envelope is always
+    // valid JSON. The client decodes when bodyEncoding === 'base64'.
+    $envelope['body']         = base64_encode($respBody);
     $envelope['bodyEncoding'] = 'base64';
     $out = json_encode($envelope, JSON_UNESCAPED_SLASHES);
 }
 
 if ($out === false) {
-    http_response_code(502);
-    echo json_encode(['error' => 'Could not encode response']);
-    exit;
+    pp_json_error(502, 'Could not encode response');
 }
 echo $out;

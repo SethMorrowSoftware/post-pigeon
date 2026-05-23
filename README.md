@@ -12,15 +12,17 @@ If `proxy.php` is reachable, requests are sent through it as a CORS-bypassing cU
 - **Admin panel** — admin-only invites: create users with auto-generated temp passwords, promote/demote, disable, delete, force password reset; first user (created via `setup.php`) is automatically admin
 - **MySQL workspace storage** — each user's collections, requests, environments, and history live in proper relational tables (`utf8mb4`, foreign keys, `ON DELETE CASCADE`)
 - **Request workshop** — method, URL with `{{var}}` substitution, query params, headers, body (none / form-data / x-www-form-urlencoded / raw JSON·XML·HTML·text·JS), auth (none, Basic, Bearer, API Key)
-- **Response viewer** — status pill, time, size, pretty / raw / sandboxed-HTML preview with JSON syntax coloring, in-response search, headers table, cookies, synthetic timeline
-- **Collections + history** — server-side persistence in MySQL, mirrored to `localStorage` for instant loads
-- **Environments** — multiple sets of `{{vars}}`, switchable from the topbar; live-highlighted in the URL bar
+- **Response viewer** — status pill, time, size, pretty / raw / sandboxed-HTML preview with JSON syntax coloring, in-response search, headers table, cookies, real cURL-phase timeline (DNS / TCP / TLS / wait / download)
+- **Collections + history** — server-side persistence in MySQL, mirrored to `localStorage` for instant loads. Rename / duplicate / delete from the sidebar; re-saving updates the existing entry instead of creating duplicates.
+- **Environments** — multiple sets of `{{vars}}`, switchable from the topbar; live-highlighted in the URL bar. Rename / delete inline.
 - **Pre-request scripts + tests** — sandboxed `rb.test()`, `rb.expect()`, `rb.env.set()` helpers
 - **Code generator** — cURL, fetch, axios, Python `requests`, PHP cURL, Go `net/http`, raw HTTP
-- **Import / export** — paste a `curl` command, paste JSON, or download the whole workspace
+- **Import / export** — paste a `curl` command (supports `-X`, `-H`, `-d`, `--data-urlencode`, `-u`, `--url`, `-A`, `-e`, `-b`, `-k`, `-L`, `--max-time`, ANSI-C `$'…'` quoting, line continuations), paste JSON, or download the whole workspace
+- **Tabs survive reload** — your open tabs and their unsaved edits are cached in `localStorage` so a page refresh doesn't drop in-flight work
+- **SSRF guard** — by default `proxy.php` refuses to fetch private / loopback / link-local hosts; flip `proxy_allow_private` in `config.php` if you actually need to test internal services
 - **Tabs, splitter, keyboard shortcuts** — `⌘↵` send, `⌘S` save, `⌘T` new tab, `⌘W` close, `/` focus search
 
-> **Heads-up — limitations:** the **binary** body mode is UI only (the file picker shows up but a binary file is not yet streamed through the proxy). The **timeline** tab shows synthetic phases — cURL's real DNS/TCP/TLS phase numbers aren't plumbed through `proxy.php` yet. There is **no built-in cookie jar** — every request is independent. **There is no self-service signup** — by design, only an admin can create accounts.
+> **Heads-up — limitations:** the **binary** body mode is UI only (the file picker shows up but a binary file is not yet streamed through the proxy). There is **no built-in cookie jar** — every request is independent. **There is no self-service signup** — by design, only an admin can create accounts.
 
 ---
 

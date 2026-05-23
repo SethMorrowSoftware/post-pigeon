@@ -255,8 +255,9 @@ function pp_safe_id(string $raw): string {
 }
 
 function pp_clip(string $s, int $max): string {
-    if (strlen($s) <= $max) return $s;
-    return substr($s, 0, $max);
+    // Use the UTF-8 safe helper so multi-byte names don't get split mid-char,
+    // which would otherwise produce mojibake or trigger MySQL utf8mb4 errors.
+    return pp_clip_utf8($s, $max);
 }
 
 function pp_array_has_id(array $arr, string $id): bool {

@@ -131,14 +131,71 @@ function pp_check_same_origin(): void {
     }
     if ($origin === '') return; // no header to verify; rely on SameSite cookie
     $host = $_SERVER['HTTP_HOST'] ?? '';
-    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-    $expectedHttp  = $scheme . '://' . $host;
-    $expectedAny   = ['http://' . $host, 'https://' . $host];
-    $originHost = parse_url($origin, PHP_URL_HOST);
-    $originScheme = parse_url($origin, PHP_URL_SCHEME) ?: '';
-    if ($originHost !== $host) {
+    // Strip default ports so https://example.com:443 matches example.com.
+    $hostNoPort = preg_replace('/:(80|443)$/', '', $host);
+    $originHost = parse_url($origin, PHP_URL_HOST) ?? '';
+    $originPort = parse_url($origin, PHP_URL_PORT);
+    if ($originPort && !in_array((int)$originPort, [80, 443], true)) {
+        $originHost .= ':' . $originPort;
+    }
+    if ($originHost !== $host && $originHost !== $hostNoPort) {
         pp_json_error(403, 'Cross-origin request blocked');
     }
+}
+
+/**
+ * Decide whether a hostname/IP literal points at an internal or otherwise
+ * disallowed target. Used by proxy.php to defend against SSRF abuse beyond
+ * the auth gate. We resolve hostnames first so an attacker can't slip
+ * something like `internal.example.com` that returns 10.0.0.1.
+ *
+ * Returns null if OK, or a string reason describing why it was blocked.
+ */
+function pp_ssrf_block_reason(string $url): ?string {
+    $host = parse_url($url, PHP_URL_HOST);
+    if (!$host) return 'invalid host';
+    // Strip surrounding brackets from raw IPv6 literals.
+    $host = trim($host, '[]');
+
+    $ips = [];
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $ips[] = $host;
+    } else {
+        // Resolve A + AAAA. dns_get_record is disabled on some shared hosts,
+        // so fall back to gethostbyname for IPv4 — without that fallback the
+        // guard would silently no-op when DNS functions are restricted.
+        if (function_exists('dns_get_record')) {
+            $a = @dns_get_record($host, DNS_A);
+            if (is_array($a)) foreach ($a as $r) if (!empty($r['ip']))   $ips[] = $r['ip'];
+            $aaaa = @dns_get_record($host, DNS_AAAA);
+            if (is_array($aaaa)) foreach ($aaaa as $r) if (!empty($r['ipv6'])) $ips[] = $r['ipv6'];
+        }
+        if (!$ips) {
+            $resolved = @gethostbyname($host);
+            if ($resolved && $resolved !== $host && filter_var($resolved, FILTER_VALIDATE_IP)) {
+                $ips[] = $resolved;
+            }
+        }
+    }
+    foreach ($ips as $ip) {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return 'target resolves to a private / reserved address (' . $ip . ')';
+        }
+    }
+    return null;
+}
+
+/**
+ * UTF-8 safe truncation. Falls back to strlen-based clipping if the mbstring
+ * extension is unavailable.
+ */
+function pp_clip_utf8(string $s, int $maxChars): string {
+    if (function_exists('mb_substr') && function_exists('mb_strlen')) {
+        return mb_strlen($s, 'UTF-8') <= $maxChars
+            ? $s
+            : mb_substr($s, 0, $maxChars, 'UTF-8');
+    }
+    return strlen($s) <= $maxChars ? $s : substr($s, 0, $maxChars);
 }
 
 function pp_random_id(int $bytes = 8): string {
