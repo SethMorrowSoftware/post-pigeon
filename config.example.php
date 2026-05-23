@@ -42,4 +42,12 @@ return [
     // Failed login attempts allowed per IP per window before login is locked.
     'login_max_attempts' => 8,
     'login_window_seconds' => 15 * 60, // 15 minutes
+
+    // ----- Proxy SSRF guard ----------------------------------------------
+    // By default proxy.php refuses to fetch private / loopback / link-local
+    // hosts (10.0.0.0/8, 192.168.0.0/16, 127.0.0.0/8, ::1, fe80::/10, etc.)
+    // so an authenticated user can't probe the host's internal network.
+    // Flip this to true if you really need to test 127.0.0.1 or an internal
+    // service from the same box.
+    'proxy_allow_private' => false,
 ];

@@ -277,6 +277,23 @@ code { font: 12px/1 var(--mono); color: var(--accent-2); }
 .tree-leaf-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tree-leaf-time { font: 400 10px var(--mono); color: var(--text-mute); }
 
+/* Row actions — reveal on hover, lightweight so they don't fight for attention */
+.tree-actions {
+  display: inline-flex; gap: 2px;
+  opacity: 0; transition: opacity 80ms;
+}
+.tree-leaf:hover .tree-actions,
+.tree-group-header:hover .tree-actions,
+.tree-actions:focus-within { opacity: 1; }
+.tree-act {
+  width: 18px; height: 18px;
+  font: 500 11px/1 var(--mono); color: var(--text-mute);
+  border: 1px solid transparent; border-radius: var(--radius);
+  background: transparent;
+}
+.tree-act:hover { color: var(--accent); border-color: var(--line); background: var(--bg-3); }
+.tree-act[data-act="delete"]:hover { color: var(--err); border-color: var(--err); }
+
 /* Method tag */
 .method-tag {
   font: 600 9px/1 var(--mono);

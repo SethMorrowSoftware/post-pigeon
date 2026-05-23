@@ -105,6 +105,22 @@ function pp_throttle_cleanup(): void {
     pp_db_exec('DELETE FROM auth_throttle WHERE attempted_at < (UTC_TIMESTAMP() - INTERVAL 7 DAY)');
 }
 
+/**
+ * Trigger cleanups on roughly 1/N requests so the throttle + sessions tables
+ * don't grow unboundedly on long-running deployments. Cheap: random() short-
+ * circuits before any DB work.
+ */
+function pp_maybe_gc(int $oneIn = 50): void {
+    if (random_int(1, max(1, $oneIn)) !== 1) return;
+    try {
+        pp_throttle_cleanup();
+        pp_session_cleanup();
+    } catch (Throwable $e) {
+        // GC failures are non-fatal — log and move on.
+        error_log('post-pigeon: gc failed: ' . $e->getMessage());
+    }
+}
+
 /* ---------------- sessions ---------------- */
 
 function pp_session_cookie_name(): string {
@@ -228,6 +244,7 @@ function pp_session_cleanup(): void {
 function pp_require_user(): array {
     $u = pp_current_user();
     if (!$u) pp_json_error(401, 'Not authenticated');
+    pp_maybe_gc();
     return $u;
 }
 
