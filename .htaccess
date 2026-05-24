@@ -1,6 +1,9 @@
 # Post Pigeon — root .htaccess.
 DirectoryIndex index.php index.html app.html
 
+# Don't expose the directory listing if index.php is ever missing.
+Options -Indexes
+
 # Block direct download of any persisted JSON (legacy file storage).
 <FilesMatch "\.json$">
   Require all denied
@@ -11,3 +14,26 @@ DirectoryIndex index.php index.html app.html
 <FilesMatch "^(config\.php|schema\.sql|\.env|composer\.(json|lock))$">
   Require all denied
 </FilesMatch>
+
+# ----- Security headers ---------------------------------------------------
+# Defence-in-depth. None of these are load-bearing — the app's own auth and
+# same-origin checks are — but they cut clickjacking, MIME sniffing, and
+# unintended browser feature access.
+<IfModule mod_headers.c>
+  Header always set X-Frame-Options "DENY"
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=()"
+  Header always set Cross-Origin-Opener-Policy "same-origin"
+
+  # Long-cache static assets (CSS/JS/SVG/fonts/images). The filenames are
+  # stable, so a hard refresh is the escape hatch when iterating.
+  <FilesMatch "\.(css|js|svg|woff2?|ttf|png|jpg|jpeg|gif|ico|webp)$">
+    Header set Cache-Control "public, max-age=86400, must-revalidate"
+  </FilesMatch>
+
+  # PHP responses are dynamic — never let an intermediate cache hold them.
+  <FilesMatch "\.php$">
+    Header set Cache-Control "no-store"
+  </FilesMatch>
+</IfModule>

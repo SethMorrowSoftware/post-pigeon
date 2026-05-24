@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS history (
   time_ms   INT           NOT NULL DEFAULT 0,
   snapshot  JSON          NULL,
   PRIMARY KEY (id, user_id),
-  KEY idx_history_user_ts (user_id, ts)
+  KEY idx_history_user_ts (user_id, ts),
+  CONSTRAINT fk_history_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS user_settings (
