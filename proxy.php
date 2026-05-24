@@ -57,12 +57,43 @@ $timeout = pp_clamp_int($req['timeout'] ?? 30, 1, 600, 30);
 $followRedirects = !empty($req['followRedirects']);
 $verifySSL = !array_key_exists('verifySSL', $req) ? true : (bool)$req['verifySSL'];
 
+// Cap the response body so a single proxied request can't exhaust PHP's
+// memory_limit. Configurable, but always bounded — shared-hosting PHP
+// processes are typically capped at 128–256 MiB total.
+$maxResponseBytes = pp_clamp_int(
+    pp_config_get('proxy_max_response_bytes', 32 * 1024 * 1024),
+    64 * 1024,         // 64 KiB minimum so the guard isn't useless
+    256 * 1024 * 1024, // 256 MiB hard ceiling
+    32 * 1024 * 1024   // 32 MiB default
+);
+
+$respHeaders = '';
+$respBody    = '';
+$tooLarge    = false;
+
 $ch = curl_init();
 $curlOpts = [
     CURLOPT_URL            => $url,
     CURLOPT_CUSTOMREQUEST  => $method,
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_HEADER         => true,
+    // Capture headers + body via callbacks so we can hard-cap the body size.
+    CURLOPT_RETURNTRANSFER => false,
+    CURLOPT_HEADER         => false,
+    CURLOPT_HEADERFUNCTION => static function ($_ch, string $hdr) use (&$respHeaders): int {
+        $respHeaders .= $hdr;
+        return strlen($hdr);
+    },
+    CURLOPT_WRITEFUNCTION  => static function ($_ch, string $chunk) use (&$respBody, &$tooLarge, $maxResponseBytes): int {
+        if ($tooLarge) return 0;
+        if (strlen($respBody) + strlen($chunk) > $maxResponseBytes) {
+            $tooLarge = true;
+            return 0; // returning < len(chunk) signals libcurl to abort
+        }
+        $respBody .= $chunk;
+        return strlen($chunk);
+    },
+    // Fast path: if the server sends a Content-Length above the cap, abort
+    // before downloading a byte.
+    CURLOPT_MAXFILESIZE    => $maxResponseBytes,
     CURLOPT_TIMEOUT        => $timeout,
     CURLOPT_CONNECTTIMEOUT => min($timeout, 15),
     CURLOPT_FOLLOWLOCATION => $followRedirects,
@@ -104,13 +135,21 @@ if ($body !== null && $body !== '' && !in_array($method, ['GET','HEAD'], true)) 
 }
 
 $t0 = microtime(true);
-$resp = curl_exec($ch);
+$ok = curl_exec($ch);
 $t1 = microtime(true);
 
-if ($resp === false) {
+if ($ok === false) {
     $err   = curl_error($ch) ?: 'cURL request failed';
     $errno = curl_errno($ch);
     curl_close($ch);
+    if ($tooLarge) {
+        pp_json(502, [
+            'error'  => 'Response exceeded the configured maximum of '
+                        . number_format($maxResponseBytes) . ' bytes.',
+            'errno'  => $errno,
+            'timeMs' => (int)(($t1 - $t0) * 1000),
+        ]);
+    }
     pp_json(502, [
         'error'  => $err,
         'errno'  => $errno,
@@ -119,9 +158,7 @@ if ($resp === false) {
 }
 
 $info       = curl_getinfo($ch);
-$headerSize = (int)($info['header_size'] ?? 0);
-$rawHeaders = (string)substr((string)$resp, 0, $headerSize);
-$respBody   = (string)substr((string)$resp, $headerSize);
+$rawHeaders = $respHeaders;
 
 // Parse the LAST response's headers — cURL concatenates 1xx and redirect
 // preludes when followLocation is on, so we want the final block.

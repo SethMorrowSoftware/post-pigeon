@@ -50,4 +50,12 @@ return [
     // Flip this to true if you really need to test 127.0.0.1 or an internal
     // service from the same box.
     'proxy_allow_private' => false,
+
+    // ----- Proxy response cap --------------------------------------------
+    // Maximum response body size proxy.php will buffer, in bytes. A single
+    // request can't exceed this — protects shared-hosting PHP processes
+    // (typically 128–256 MiB memory_limit) from OOM via a giant response.
+    // Floor 64 KiB, ceiling 256 MiB. Default 32 MiB is plenty for any API
+    // response you'd realistically debug here.
+    'proxy_max_response_bytes' => 32 * 1024 * 1024,
 ];

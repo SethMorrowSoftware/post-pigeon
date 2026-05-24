@@ -9,6 +9,14 @@ if (!defined('PP_ROOT')) {
     define('PP_ROOT', dirname(__DIR__));
 }
 
+// Production hardening: never echo PHP errors into the response body. A
+// misconfigured cPanel host may default display_errors to On, which would
+// leak file paths, DB credentials in PDO stack traces, etc. Errors still
+// reach the web server log via error_log() — that's where they belong.
+@ini_set('display_errors', '0');
+@ini_set('display_startup_errors', '0');
+@ini_set('log_errors', '1');
+
 /**
  * Load and cache the deployment config. Falls back to config.example.php so
  * setup.php can still render a helpful error before config.php exists.
